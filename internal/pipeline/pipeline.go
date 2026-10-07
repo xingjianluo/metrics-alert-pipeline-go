@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xingjianluo/metrics-alert-pipeline-go/internal/checkpoint"
 	"github.com/xingjianluo/metrics-alert-pipeline-go/internal/engine"
 	"github.com/xingjianluo/metrics-alert-pipeline-go/internal/model"
 	"github.com/xingjianluo/metrics-alert-pipeline-go/internal/rule"
@@ -34,6 +35,18 @@ type Config struct {
 	FlushInterval time.Duration
 	// Ruleset is the initial rule snapshot.
 	Ruleset rule.Snapshot
+	// CheckpointDir enables state persistence when non-empty: alert
+	// states, unflushed windows and recent event history are saved
+	// periodically and on shutdown, and loaded back on start.
+	CheckpointDir string
+	// CheckpointInterval is how often state is persisted (default 5s).
+	CheckpointInterval time.Duration
+	// CheckpointsKept bounds how many checkpoint files are retained
+	// (default checkpoint.DefaultKeep).
+	CheckpointsKept int
+	// MaxEventsKept bounds the persisted recent-event history
+	// (default 500).
+	MaxEventsKept int
 	// EventSink receives Firing/Resolved events (may be nil).
 	EventSink func(model.AlertEvent)
 	// Logger defaults to slog.Default().
@@ -63,6 +76,7 @@ type Pipeline struct {
 	engine *engine.Engine
 	queue  *boundedQueue
 	now    func() time.Time
+	ckpt   *checkpoint.Manager // nil when persistence is disabled
 
 	wg      sync.WaitGroup
 	stopCh  chan struct{}
@@ -75,6 +89,7 @@ type Pipeline struct {
 	firing     int64
 	resolved   int64
 	ticks      int64
+	events     []model.AlertEvent // bounded recent-event history
 }
 
 // New constructs a Pipeline.
@@ -91,6 +106,12 @@ func New(cfg Config) (*Pipeline, error) {
 	if cfg.FlushInterval <= 0 {
 		cfg.FlushInterval = 100 * time.Millisecond
 	}
+	if cfg.CheckpointInterval <= 0 {
+		cfg.CheckpointInterval = 5 * time.Second
+	}
+	if cfg.MaxEventsKept <= 0 {
+		cfg.MaxEventsKept = 500
+	}
 	log := cfg.Logger
 	if log == nil {
 		log = slog.Default()
@@ -100,13 +121,24 @@ func New(cfg Config) (*Pipeline, error) {
 		now = time.Now
 	}
 	st := store.New(&cfg.Store)
-	return &Pipeline{
+	p := &Pipeline{
 		cfg: cfg, log: log, store: st,
 		engine: engine.New(cfg.Ruleset),
 		queue:  newBoundedQueue(cfg.QueueSize, cfg.Policy),
 		now:    now, stopCh: make(chan struct{}),
 		rejectedBy: map[model.RejectReason]int64{},
-	}, nil
+	}
+	if cfg.CheckpointDir != "" {
+		mgr, err := checkpoint.NewManager(cfg.CheckpointDir, cfg.CheckpointsKept, log)
+		if err != nil {
+			return nil, err
+		}
+		p.ckpt = mgr
+		if err := p.restore(); err != nil {
+			return nil, err
+		}
+	}
+	return p, nil
 }
 
 // Start launches ingestion workers and the evaluator loop.
@@ -169,12 +201,21 @@ func (p *Pipeline) evalLoop() {
 	defer p.wg.Done()
 	t := time.NewTicker(p.cfg.FlushInterval)
 	defer t.Stop()
+	var ckptTick <-chan time.Time
+	var ckptTimer *time.Ticker
+	if p.ckpt != nil {
+		ckptTimer = time.NewTicker(p.cfg.CheckpointInterval)
+		ckptTick = ckptTimer.C
+		defer ckptTimer.Stop()
+	}
 	for {
 		select {
 		case <-p.stopCh:
 			return
 		case now := <-t.C:
 			p.evaluateOnce(now)
+		case <-ckptTick:
+			p.saveCheckpoint()
 		}
 	}
 }
@@ -204,15 +245,14 @@ func (p *Pipeline) evaluateOnce(now time.Time) {
 			"state", ev.State.String(), "value", ev.Value,
 			"eval_time", ev.EvalTime.Format(time.RFC3339),
 			"fired_at", formatTime(ev.FiredAt), "resolved_at", formatTime(ev.ResolvedAt))
+		p.mu.Lock()
 		if ev.State == model.StateFiring {
-			p.mu.Lock()
 			p.firing++
-			p.mu.Unlock()
 		} else {
-			p.mu.Lock()
 			p.resolved++
-			p.mu.Unlock()
 		}
+		p.recordEventLocked(ev)
+		p.mu.Unlock()
 		if p.cfg.EventSink != nil {
 			p.cfg.EventSink(ev)
 		}
@@ -234,6 +274,9 @@ func (p *Pipeline) Stop(ctx context.Context) error {
 		p.wg.Wait() // workers + eval loop
 		// Final deterministic flush/evaluate after all queued data is in.
 		p.evaluateOnce(p.now())
+		// Persist the settled state so a restart continues exactly
+		// here: no pending timer reset, no event replay.
+		p.saveCheckpoint()
 		close(done)
 	}()
 
