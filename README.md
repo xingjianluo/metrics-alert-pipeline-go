@@ -16,6 +16,11 @@ go run ./cmd/demo -fast
 
 # 带节奏的人类可读版本（每步 60ms）
 go run ./cmd/demo
+
+# 启用状态落盘的演示：退出时写检查点；同一目录再跑一次可看到恢复日志
+# （重放的旧时间戳样本会按水位被明确拒绝为 stale_sample，而不是重复计数）
+go run ./cmd/demo -fast -ckpt-dir /tmp/ckpt-demo
+go run ./cmd/demo -fast -ckpt-dir /tmp/ckpt-demo   # 第二次：checkpoint restored ...
 ```
 
 `demo` 结束时会自校验：必须恰好 3 个 Firing、3 个 Resolved，且观察到
@@ -30,7 +35,8 @@ go run ./cmd/demo
 | `internal/store` | 按 series 存样本、按对齐窗口聚合；并发安全；基数上限；乱序/重复处理；窗口水位与 GC |
 | `internal/rule` | 规则定义、标签过滤、字段选择与阈值谓词；规则快照校验 |
 | `internal/engine` | 告警状态机（每 ruleID+series 一份状态）、持续时间判定、抖动去重、热更新保状态 |
-| `internal/pipeline` | 有界队列 + ingest worker + 周期评估；背压/丢弃策略；优雅退出与最终一致性 flush |
+| `internal/pipeline` | 有界队列 + ingest worker + 周期评估；背压/丢弃策略；优雅退出与最终一致性 flush；检查点调度 |
+| `internal/checkpoint` | 状态落盘与重启恢复：原子写入、校验和、多份留存、损坏回退、版本检查 |
 | `cmd/demo` | 确定性本地演示 |
 
 ## 数据模型
@@ -125,6 +131,86 @@ rule.Rule{
 - 被删除规则的状态退役；新增规则从空状态起步；
 - 新快照先 `Validate()`（字段合法、ID 无重复），失败则当前规则集不变。
 
+## 状态落盘与重启恢复
+
+设置 `Pipeline.Config.CheckpointDir` 即开启持久化：进程重启后自动从最近的
+可用检查点接着算，而不是从零开始。
+
+### 落盘范围
+
+每份检查点是一个自包含的 JSON 文件（`ckpt-<时间戳>.json`），包含：
+
+- **告警状态机**：每个 `(ruleID, series)` 的状态（pending/firing/resolving/
+  inactive）、当前 run 的起点 `since`、本 episode 的首次触发时间 `firedAt`、
+  以及 `episode` 标志（该告警是否已对外通告过——这是重启后不重复发
+  Firing 的关键）；
+- **未判定完的窗口数据**：所有尚未 flush 的窗口（精确到每个样本时间戳的
+  值，重复合并语义不变）和乱序水位 `latestWindow`；
+- **规则集**：落盘时的规则快照（版本 + 全部规则），用于恢复时的兼容判定
+  与日志解释；
+- **事件历史**：最近的 Firing/Resolved 事件（有界，见下文上限）。
+
+### 落盘时机与性能
+
+- 周期落盘由**独立 goroutine** 执行（`CheckpointInterval`，默认 10s），
+  采集与判定只被一次短暂的状态拷贝阻塞，磁盘 I/O 不在关键路径上；
+- `Stop()` 在最终 flush + evaluate 之后写最后一份检查点，优雅退出的状态
+  就是下次启动的起点；
+- 每次写入都是 **临时文件 + 原子 rename**，进程在写入中途崩溃不会留下
+  半个可用文件。
+
+### 恢复语义
+
+- 待触发计时**不清零**：pending 的 run 起点 `since` 原样恢复，重启前累计
+  的持续时间继续有效；
+- 已触发未恢复的告警**不重发**：`episode` 标志恢复后，同一 episode 内
+  不会再产生第二个 Firing；恢复计时（resolving）同样延续，Resolved 不丢；
+- 同一告警的重复事件仍按 `(rule, series, episode)` 标识去重，与重启前一致；
+- 事件历史随检查点恢复（`Pipeline.EventHistory()`），有保留上限。
+
+### 与规则热更新/变更的兼容范围
+
+恢复时套用与热更新**完全相同**的兼容规则（按 rule ID 对齐）：
+
+- 新旧规则集里 **ID 相同的规则：状态原样延续**，即使阈值/持续时间被修改
+  （修改后的谓词从下一次判定起生效；若新条件下原状态不再成立，按状态机
+  正常迁移，结论可解释）；
+- **被删除的规则**：其状态退役（日志逐条打印 `checkpoint state retired`），
+  不再参与判定；
+- **新增的规则**：从干净状态起步，需要完整走完自己的 `ForDuration`；
+- 落盘数据的**格式版本**与当前不一致时：旧版本走迁移表（当前只有 v1，
+  无可迁移对象），更新或无法识别的版本**明确拒绝启动**并打印原因
+  （如 `format version 99 is newer than supported 1`），绝不悄悄按空状态
+  继续跑。
+
+### 损坏与空间上限
+
+- 每份文件带 CRC32 校验和；加载时从**新到旧**依次尝试，损坏/截断/版本
+  不符的文件被跳过（日志 `checkpoint skipped` 带原因），自动回退到上一个
+  可用点；
+- 目录里有文件但**全部不可用**时，`New` 返回错误拒绝启动
+  （`refusing to start empty`），避免空状态造成误报/漏报；目录为空才是
+  正常的首次启动（`ErrNoCheckpoint`）；
+- **留存上限**：`MaxCheckpoints`（默认 3）份，超出后最旧的被清理，磁盘
+  占用不无限增长；**事件历史上限**：`MaxEvents`（默认 256）条，只保留
+  最近的；
+- 恢复时若检查点是在更大基数上限下写入的，超出当前 `MaxSeries` 的 series
+  被跳过并计数告警，不静默超限。
+
+### 本地验证
+
+```bash
+# 重启恢复专项测试（场景日志可见）
+go test ./internal/pipeline/ -race -count=1 -v -run 'TestRestart|TestCorrupt|TestCheckpoint'
+go test ./internal/checkpoint/ -race -count=1 -v
+
+# 手动演示：第一次跑写检查点，Ctrl-C 或跑完后用同一目录再跑一次，
+# 日志出现 "checkpoint restored"，水位延续（重放的旧样本被 stale_sample 拒绝）
+go run ./cmd/demo -ckpt-dir /tmp/ckpt-demo
+go run ./cmd/demo -ckpt-dir /tmp/ckpt-demo
+```
+
+
 ## 背压、丢弃与优雅退出
 
 - 采集侧是固定容量 FIFO 环形队列（不使用 channel，是为了支持队头驱逐）：
@@ -172,6 +258,17 @@ go test ./internal/pipeline/ -race -v    # 端到端场景
 - **优雅退出**：50 个排队样本全部被 accepted，不丢一半。
 - **队列策略**：FIFO、`drop_newest` 的 `queue_full`、`drop_oldest` 驱逐
   计数、Close 唤醒阻塞写者。
+- **重启恢复**（`recovery_test.go`）：待触发计时跨重启延续、第 3 个命中
+  窗口按时触发且全程只触发一次；已触发 episode 重启后不重发 Firing、
+  Resolved 不丢；未 flush 的窗口数据重启后参与判定；事件历史随检查点保留。
+- **检查点 + 规则变更**：同 ID 规则（改了阈值）状态延续且不误触发、被删
+  规则状态退役、新增规则从干净状态起步。
+- **损坏检查点**：最新一份损坏/截断自动回退到上一份；全部损坏拒绝启动
+  并打印原因；格式版本过新明确拒绝（`checkpoint_test.go`、
+  `recovery_test.go`）。
+- **留存上限**：检查点份数与事件历史条数均有上限，超限自动清理。
+- **恢复过程并发稳定**：周期落盘与并发写入/判定同时进行，`-race` 下
+  稳定，检查点始终可读。
 
 ## 设计取舍
 
@@ -181,3 +278,9 @@ go test ./internal/pipeline/ -race -v    # 端到端场景
   告警规则可在 rule 层另加语义。
 - 基数限制按“当前持有窗口的 series”计数；停止上报的 series 在窗口
   滞留期后自然退役，长期 series 数仍受 `MaxSeries` 约束。
+- 检查点采用“多份留存 + 加载时回退”而非单文件 + 备份：实现简单，
+  且天然覆盖“最新一份写了一半”的场景；代价是磁盘占用约为单份的
+  `MaxCheckpoints` 倍（默认 3 份，本地规模可忽略）。
+- 恢复按 rule ID 对齐而不是按规则内容哈希：与热更新语义保持一致，
+  “改了阈值但 ID 不变”被视为同一规则的延续，结论可解释；如果需要
+  “改阈值即重置状态”，应换一个新的 rule ID。

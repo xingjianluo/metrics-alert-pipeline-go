@@ -68,6 +68,7 @@ func valueAt(host, sec int64) float64 {
 
 func main() {
 	fast := flag.Bool("fast", false, "skip inter-step sleeps")
+	ckptDir := flag.String("ckpt-dir", "", "enable state persistence in this directory (restart the demo with the same dir to resume)")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
@@ -92,6 +93,12 @@ func main() {
 		FlushInterval: time.Hour, // driven deterministically below
 		Ruleset:       rules,
 		Logger:        log,
+		// Persistence: save every 2s of script progress and on shutdown;
+		// a restart with the same -ckpt-dir resumes instead of restarting.
+		CheckpointDir:      *ckptDir,
+		CheckpointInterval: 2 * time.Second,
+		MaxCheckpoints:     3,
+		MaxEvents:          64,
 		EventSink: func(ev model.AlertEvent) {
 			log.Warn("ALERT EVENT",
 				"rule", ev.RuleID, "series", string(ev.Series),
